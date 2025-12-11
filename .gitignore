@@ -29,3 +29,7 @@ turnserver.conf
 
 # Visual Studio code debug
 *__debug*
+
+# Agents
+AGENTS.md
+CLAUDE.md
