@@ -80,11 +80,36 @@ export default function App() {
   const updatePresence = (list: string[] = [], live: string[] = []) => {
     setPeers(list);
     setBroadcasting(live);
+
+    // Drop any remote streams that no longer correspond to an active broadcaster.
+    const liveSet = new Set(live);
+    setRemoteStreams((prev) => {
+      const next = new Map(prev);
+      Array.from(next.keys())
+        .filter((id) => !liveSet.has(id))
+        .forEach((id) => {
+          next.get(id)?.getTracks().forEach((t) => t.stop());
+          next.delete(id);
+        });
+      return next;
+    });
   };
 
   const prunePeerLists = (id: string) => {
     setPeers((prev) => prev.filter((p) => p !== id));
     setBroadcasting((prev) => prev.filter((p) => p !== id));
+  };
+
+  const removeRemoteStream = (id: string) => {
+    setRemoteStreams((prev) => {
+      const next = new Map(prev);
+      const stream = next.get(id);
+      if (stream) {
+        stream.getTracks().forEach((track) => track.stop());
+      }
+      next.delete(id);
+      return next;
+    });
   };
 
   const removePeer = (id: string) => {
@@ -93,11 +118,7 @@ export default function App() {
       pc.close();
       connections.delete(id);
     }
-    setRemoteStreams((prev) => {
-      const next = new Map(prev);
-      next.delete(id);
-      return next;
-    });
+    removeRemoteStream(id);
 
     prunePeerLists(id);
   };
@@ -248,6 +269,10 @@ export default function App() {
 
     if (msg.type === "peer-left" && msg.id) {
       removePeer(msg.id);
+    }
+
+    if (msg.type === "broadcast-state" && msg.id && msg.enabled === false) {
+      removeRemoteStream(msg.id);
     }
 
     if (msg.type === "peer-joined" && msg.id && broadcastEnabled()) {
