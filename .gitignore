@@ -23,3 +23,9 @@ backend/.env
 
 # VSCode
 .vscode
+
+# Coturn
+turnserver.conf
+
+# Visual Studio code debug
+*__debug*

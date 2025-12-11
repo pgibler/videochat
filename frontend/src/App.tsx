@@ -6,6 +6,8 @@ type StateMessage = {
   peers?: string[];
   broadcasting?: string[];
   enabled?: boolean;
+  iceServers?: RTCIceServer[];
+  iceMode?: string;
 };
 
 type SignalMessage = {
@@ -17,9 +19,7 @@ type SignalMessage = {
 
 type IncomingMessage = StateMessage | SignalMessage;
 
-const iceConfig: RTCConfiguration = {
-  iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
-};
+const defaultIceServers: RTCIceServer[] = [{ urls: "stun:stun.l.google.com:19302" }];
 
 const wsURL = () => {
   const env = import.meta.env.VITE_WS_URL as string | undefined;
@@ -63,6 +63,7 @@ export default function App() {
   const [broadcastEnabled, setBroadcastEnabled] = createSignal(false);
   const [connected, setConnected] = createSignal(false);
   const [status, setStatus] = createSignal("Connecting to signaling server...");
+  const [iceServers, setIceServers] = createSignal<RTCIceServer[]>(defaultIceServers);
   const [remoteStreams, setRemoteStreams] = createSignal<Map<string, MediaStream>>(
     new Map()
   );
@@ -139,7 +140,7 @@ export default function App() {
     let pc = connections.get(id);
     if (pc) return pc;
 
-    pc = new RTCPeerConnection(iceConfig);
+    pc = new RTCPeerConnection({ iceServers: iceServers() });
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
@@ -265,6 +266,15 @@ export default function App() {
     if (msg.type === "welcome" && msg.id) {
       setPeerId(msg.id);
       setStatus("Connected");
+      if (msg.iceServers && msg.iceServers.length) {
+        setIceServers(msg.iceServers);
+        console.log("Using ICE servers from signaling", {
+          servers: msg.iceServers,
+          mode: msg.iceMode || "default"
+        });
+      } else {
+        console.log("No ICE servers provided by signaling; using defaults", defaultIceServers);
+      }
     }
 
     if (msg.type === "peer-left" && msg.id) {

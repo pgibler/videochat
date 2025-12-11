@@ -34,9 +34,11 @@ var upgrader = websocket.Upgrader{
 }
 
 type hub struct {
-	mu      sync.RWMutex
-	clients map[string]*client
-	redis   *redis.Client
+	mu         sync.RWMutex
+	clients    map[string]*client
+	redis      *redis.Client
+	iceServers []iceServer
+	iceMode    string
 }
 
 type client struct {
@@ -53,11 +55,13 @@ type inboundMessage struct {
 }
 
 type statePayload struct {
-	Type         string   `json:"type"`
-	ID           string   `json:"id,omitempty"`
-	Peers        []string `json:"peers,omitempty"`
-	Broadcasting []string `json:"broadcasting,omitempty"`
-	Enabled      *bool    `json:"enabled,omitempty"`
+	Type         string      `json:"type"`
+	ID           string      `json:"id,omitempty"`
+	Peers        []string    `json:"peers,omitempty"`
+	Broadcasting []string    `json:"broadcasting,omitempty"`
+	Enabled      *bool       `json:"enabled,omitempty"`
+	ICEServers   []iceServer `json:"iceServers,omitempty"`
+	ICEMode      string      `json:"iceMode,omitempty"`
 }
 
 type signalPayload struct {
@@ -70,6 +74,7 @@ type signalPayload struct {
 func main() {
 	loadEnv()
 	cfg := loadConfig()
+	logConfig(cfg)
 
 	rdb := redis.NewClient(&redis.Options{
 		Addr: cfg.RedisAddr,
@@ -84,11 +89,14 @@ func main() {
 	resetPresence(ctx, rdb)
 
 	h := &hub{
-		clients: make(map[string]*client),
-		redis:   rdb,
+		clients:    make(map[string]*client),
+		redis:      rdb,
+		iceServers: cfg.ICEServers,
+		iceMode:    cfg.ICEMode,
 	}
 
 	http.Handle("/ws", h.handleWebsocket())
+	http.Handle("/debug/ice", debugICE(cfg))
 	http.Handle("/", spaHandler(cfg.StaticPath))
 
 	log.Printf("listening on %s (static: %s)", cfg.Addr, cfg.StaticPath)
@@ -101,16 +109,27 @@ type config struct {
 	Addr       string
 	RedisAddr  string
 	StaticPath string
+	ICEServers []iceServer
+	ICEMode    string
+}
+
+type iceServer struct {
+	URLs       []string `json:"urls"`
+	Username   string   `json:"username,omitempty"`
+	Credential string   `json:"credential,omitempty"`
 }
 
 func loadConfig() config {
 	addr := getenv("ADDR", ":8080")
 	redisAddr := getenv("REDIS_ADDR", "localhost:6379")
 	staticDir := getenv("STATIC_DIR", defaultStaticPath)
+	iceMode := strings.TrimSpace(os.Getenv("ICE_MODE"))
 	return config{
 		Addr:       addr,
 		RedisAddr:  redisAddr,
 		StaticPath: staticDir,
+		ICEServers: loadICEServers(iceMode),
+		ICEMode:    iceMode,
 	}
 }
 
@@ -133,6 +152,75 @@ func loadEnv() {
 			log.Printf("env load warning for %s: %v", p, err)
 		}
 	}
+}
+
+func loadICEServers(iceMode string) []iceServer {
+	defaultSTUN := []string{"stun:stun.l.google.com:19302"}
+
+	stunEnv := strings.TrimSpace(os.Getenv("STUN_URLS"))
+	turnEnv := strings.TrimSpace(os.Getenv("TURN_URLS"))
+	turnUsername := strings.TrimSpace(os.Getenv("TURN_USERNAME"))
+	turnPassword := strings.TrimSpace(os.Getenv("TURN_PASSWORD"))
+
+	var servers []iceServer
+	turnOnly := strings.EqualFold(iceMode, "turn-only")
+
+	if !turnOnly {
+		if stunEnv != "" {
+			stunURLs := splitAndClean(stunEnv)
+			if len(stunURLs) > 0 {
+				servers = append(servers, iceServer{URLs: stunURLs})
+			}
+		} else {
+			servers = append(servers, iceServer{URLs: defaultSTUN})
+		}
+	}
+
+	if turnEnv != "" {
+		turnURLs := splitAndClean(turnEnv)
+		if len(turnURLs) > 0 {
+			servers = append(servers, iceServer{
+				URLs:       turnURLs,
+				Username:   turnUsername,
+				Credential: turnPassword,
+			})
+		}
+	} else {
+		log.Printf("TURN not configured; set TURN_URLS and credentials for relay fallback")
+	}
+
+	if turnOnly && len(servers) == 0 {
+		log.Printf("ICE_MODE=turn-only set but no TURN servers are configured; falling back to default STUN")
+		servers = append(servers, iceServer{URLs: defaultSTUN})
+	}
+
+	log.Printf("ICE servers loaded (mode=%s): %+v", iceMode, servers)
+	return servers
+}
+
+func logConfig(cfg config) {
+	turnConfigured := false
+	for _, s := range cfg.ICEServers {
+		if s.Username != "" || s.Credential != "" {
+			turnConfigured = true
+			break
+		}
+	}
+
+	log.Printf("config: addr=%s static_dir=%s redis_addr=%s ice_mode=%s ice_servers=%d turn_configured=%v",
+		cfg.Addr, cfg.StaticPath, cfg.RedisAddr, cfg.ICEMode, len(cfg.ICEServers), turnConfigured)
+}
+
+func splitAndClean(csv string) []string {
+	parts := strings.Split(csv, ",")
+	var out []string
+	for _, p := range parts {
+		v := strings.TrimSpace(p)
+		if v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 func loadEnvFile(path string) error {
@@ -216,6 +304,8 @@ func (h *hub) register(ctx context.Context, c *client) error {
 		ID:           c.id,
 		Peers:        peers,
 		Broadcasting: broadcasting,
+		ICEServers:   h.iceServers,
+		ICEMode:      h.iceMode,
 	}
 	c.sendJSON(welcome)
 
@@ -440,5 +530,16 @@ func spaHandler(staticDir string) http.Handler {
 
 		index := filepath.Join(staticDir, "index.html")
 		http.ServeFile(w, r, index)
+	})
+}
+
+func debugICE(cfg config) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		payload := map[string]interface{}{
+			"mode":       cfg.ICEMode,
+			"iceServers": cfg.ICEServers,
+		}
+		_ = json.NewEncoder(w).Encode(payload)
 	})
 }
