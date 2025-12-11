@@ -5,71 +5,19 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/google/uuid"
-	"github.com/gorilla/websocket"
 	"github.com/redis/go-redis/v9"
+
+	"webrtc-go-spa/pkg/signaling"
 )
 
-const (
-	peerSetKey        = "webrtc:peers"
-	broadcastingKey   = "webrtc:broadcasting"
-	defaultStaticPath = "../frontend/dist"
-)
-
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	CheckOrigin: func(r *http.Request) bool {
-		return true
-	},
-}
-
-type hub struct {
-	mu         sync.RWMutex
-	clients    map[string]*client
-	redis      *redis.Client
-	iceServers []iceServer
-	iceMode    string
-}
-
-type client struct {
-	id   string
-	conn *websocket.Conn
-	send chan []byte
-}
-
-type inboundMessage struct {
-	Type    string          `json:"type"`
-	To      string          `json:"to,omitempty"`
-	Data    json.RawMessage `json:"data,omitempty"`
-	Enabled *bool           `json:"enabled,omitempty"`
-}
-
-type statePayload struct {
-	Type         string      `json:"type"`
-	ID           string      `json:"id,omitempty"`
-	Peers        []string    `json:"peers,omitempty"`
-	Broadcasting []string    `json:"broadcasting,omitempty"`
-	Enabled      *bool       `json:"enabled,omitempty"`
-	ICEServers   []iceServer `json:"iceServers,omitempty"`
-	ICEMode      string      `json:"iceMode,omitempty"`
-}
-
-type signalPayload struct {
-	Type string          `json:"type"`
-	From string          `json:"from"`
-	To   string          `json:"to"`
-	Data json.RawMessage `json:"data"`
-}
+const defaultStaticPath = "../frontend/dist"
 
 func main() {
 	loadEnv()
@@ -86,16 +34,18 @@ func main() {
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		log.Fatalf("redis ping failed: %v", err)
 	}
-	resetPresence(ctx, rdb)
 
-	h := &hub{
-		clients:    make(map[string]*client),
-		redis:      rdb,
-		iceServers: cfg.ICEServers,
-		iceMode:    cfg.ICEMode,
+	store := signaling.NewRedisPresence(rdb, "webrtc")
+	if err := store.Reset(ctx); err != nil {
+		log.Printf("redis reset presence: %v", err)
 	}
 
-	http.Handle("/ws", h.handleWebsocket())
+	hub := signaling.NewHub(store, signaling.HubOptions{
+		ICEServers: cfg.ICEServers,
+		ICEMode:    cfg.ICEMode,
+	})
+
+	http.Handle("/ws", hub.HTTPHandler())
 	http.Handle("/debug/ice", debugICE(cfg))
 	http.Handle("/", spaHandler(cfg.StaticPath))
 
@@ -109,14 +59,8 @@ type config struct {
 	Addr       string
 	RedisAddr  string
 	StaticPath string
-	ICEServers []iceServer
+	ICEServers []signaling.ICEServer
 	ICEMode    string
-}
-
-type iceServer struct {
-	URLs       []string `json:"urls"`
-	Username   string   `json:"username,omitempty"`
-	Credential string   `json:"credential,omitempty"`
 }
 
 func loadConfig() config {
@@ -154,7 +98,7 @@ func loadEnv() {
 	}
 }
 
-func loadICEServers(iceMode string) []iceServer {
+func loadICEServers(iceMode string) []signaling.ICEServer {
 	defaultSTUN := []string{"stun:stun.l.google.com:19302"}
 
 	stunEnv := strings.TrimSpace(os.Getenv("STUN_URLS"))
@@ -162,24 +106,24 @@ func loadICEServers(iceMode string) []iceServer {
 	turnUsername := strings.TrimSpace(os.Getenv("TURN_USERNAME"))
 	turnPassword := strings.TrimSpace(os.Getenv("TURN_PASSWORD"))
 
-	var servers []iceServer
+	var servers []signaling.ICEServer
 	turnOnly := strings.EqualFold(iceMode, "turn-only")
 
 	if !turnOnly {
 		if stunEnv != "" {
 			stunURLs := splitAndClean(stunEnv)
 			if len(stunURLs) > 0 {
-				servers = append(servers, iceServer{URLs: stunURLs})
+				servers = append(servers, signaling.ICEServer{URLs: stunURLs})
 			}
 		} else {
-			servers = append(servers, iceServer{URLs: defaultSTUN})
+			servers = append(servers, signaling.ICEServer{URLs: defaultSTUN})
 		}
 	}
 
 	if turnEnv != "" {
 		turnURLs := splitAndClean(turnEnv)
 		if len(turnURLs) > 0 {
-			servers = append(servers, iceServer{
+			servers = append(servers, signaling.ICEServer{
 				URLs:       turnURLs,
 				Username:   turnUsername,
 				Credential: turnPassword,
@@ -191,7 +135,7 @@ func loadICEServers(iceMode string) []iceServer {
 
 	if turnOnly && len(servers) == 0 {
 		log.Printf("ICE_MODE=turn-only set but no TURN servers are configured; falling back to default STUN")
-		servers = append(servers, iceServer{URLs: defaultSTUN})
+		servers = append(servers, signaling.ICEServer{URLs: defaultSTUN})
 	}
 
 	log.Printf("ICE servers loaded (mode=%s): %+v", iceMode, servers)
@@ -252,271 +196,10 @@ func loadEnvFile(path string) error {
 	return scanner.Err()
 }
 
-func resetPresence(ctx context.Context, rdb *redis.Client) {
-	if _, err := rdb.Del(ctx, peerSetKey, broadcastingKey).Result(); err != nil {
-		log.Printf("redis reset presence: %v", err)
-		return
-	}
-	log.Printf("redis presence cleared")
-}
-
-func (h *hub) handleWebsocket() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			log.Printf("upgrade error: %v", err)
-			return
-		}
-
-		id := uuid.NewString()
-		c := &client{
-			id:   id,
-			conn: conn,
-			send: make(chan []byte, 32),
-		}
-		log.Printf("ws: new connection %s from %s", c.id, r.RemoteAddr)
-
-		if err := h.register(r.Context(), c); err != nil {
-			log.Printf("register error: %v", err)
-			conn.Close()
-			return
-		}
-
-		go c.writePump()
-		c.readPump(h)
-	})
-}
-
-func (h *hub) register(ctx context.Context, c *client) error {
-	h.mu.Lock()
-	h.clients[c.id] = c
-	h.mu.Unlock()
-
-	if err := h.redis.SAdd(ctx, peerSetKey, c.id).Err(); err != nil {
-		return fmt.Errorf("redis sadd peer: %w", err)
-	}
-
-	peers, broadcasting := h.currentState(ctx)
-	log.Printf("ws: registered %s (peers=%d broadcasting=%d)", c.id, len(peers), len(broadcasting))
-
-	welcome := statePayload{
-		Type:         "welcome",
-		ID:           c.id,
-		Peers:        peers,
-		Broadcasting: broadcasting,
-		ICEServers:   h.iceServers,
-		ICEMode:      h.iceMode,
-	}
-	c.sendJSON(welcome)
-
-	join := statePayload{
-		Type:         "peer-joined",
-		ID:           c.id,
-		Peers:        peers,
-		Broadcasting: broadcasting,
-	}
-	h.broadcast(join, c.id)
-	return nil
-}
-
-func (h *hub) unregister(c *client) {
-	ctx := context.Background()
-
-	h.mu.Lock()
-	delete(h.clients, c.id)
-	h.mu.Unlock()
-
-	// Remove presence from Redis.
-	h.redis.SRem(ctx, peerSetKey, c.id)
-	h.redis.SRem(ctx, broadcastingKey, c.id)
-
-	peers, broadcasting := h.currentState(ctx)
-	log.Printf("ws: unregistered %s (peers=%d broadcasting=%d)", c.id, len(peers), len(broadcasting))
-
-	leave := statePayload{
-		Type:         "peer-left",
-		ID:           c.id,
-		Peers:        peers,
-		Broadcasting: broadcasting,
-	}
-	h.broadcast(leave, c.id)
-}
-
-func (h *hub) broadcast(msg interface{}, skipID string) {
-	data, err := json.Marshal(msg)
-	if err != nil {
-		log.Printf("marshal broadcast: %v", err)
-		return
-	}
-
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-
-	for id, cl := range h.clients {
-		if id == skipID {
-			continue
-		}
-		select {
-		case cl.send <- data:
-		default:
-			log.Printf("client send buffer full for %s, dropping message", id)
-		}
-	}
-}
-
-func (h *hub) currentState(ctx context.Context) ([]string, []string) {
-	peers, err := h.redis.SMembers(ctx, peerSetKey).Result()
-	if err != nil {
-		log.Printf("redis smembers peers: %v", err)
-	}
-	broadcasting, err := h.redis.SMembers(ctx, broadcastingKey).Result()
-	if err != nil {
-		log.Printf("redis smembers broadcasting: %v", err)
-	}
-	return peers, broadcasting
-}
-
-func (h *hub) handleInbound(c *client, msg inboundMessage) {
-	log.Printf("ws: inbound type=%s from=%s to=%s enabled=%v", msg.Type, c.id, msg.To, msg.Enabled)
-	switch msg.Type {
-	case "signal":
-		if msg.To == "" || len(msg.Data) == 0 {
-			return
-		}
-		h.forwardSignal(c.id, msg.To, msg.Data)
-	case "broadcast":
-		if msg.Enabled == nil {
-			return
-		}
-		h.updateBroadcast(c.id, *msg.Enabled)
-	default:
-		log.Printf("unknown message type from %s: %s", c.id, msg.Type)
-	}
-}
-
-func (h *hub) forwardSignal(from, to string, payload json.RawMessage) {
-	h.mu.RLock()
-	target := h.clients[to]
-	h.mu.RUnlock()
-	if target == nil {
-		log.Printf("ws: forward signal target missing %s -> %s", from, to)
-		return
-	}
-
-	msg := signalPayload{
-		Type: "signal",
-		From: from,
-		To:   to,
-		Data: payload,
-	}
-	target.sendJSON(msg)
-}
-
-func (h *hub) updateBroadcast(id string, enabled bool) {
-	ctx := context.Background()
-	var err error
-	if enabled {
-		err = h.redis.SAdd(ctx, broadcastingKey, id).Err()
-	} else {
-		err = h.redis.SRem(ctx, broadcastingKey, id).Err()
-	}
-	if err != nil {
-		log.Printf("redis update broadcast: %v", err)
-	}
-	log.Printf("ws: broadcast state id=%s enabled=%v", id, enabled)
-
-	peers, broadcasting := h.currentState(ctx)
-	state := statePayload{
-		Type:         "broadcast-state",
-		ID:           id,
-		Enabled:      &enabled,
-		Peers:        peers,
-		Broadcasting: broadcasting,
-	}
-	h.broadcast(state, "")
-}
-
-func (c *client) readPump(h *hub) {
-	defer func() {
-		h.unregister(c)
-		c.conn.Close()
-		close(c.send)
-	}()
-
-	c.conn.SetReadLimit(64 * 1024)
-	c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-	c.conn.SetPongHandler(func(string) error {
-		c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-		return nil
-	})
-
-	for {
-		_, data, err := c.conn.ReadMessage()
-		if err != nil {
-			if websocket.IsCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
-				return
-			}
-			if !errors.Is(err, websocket.ErrCloseSent) {
-				log.Printf("read error from %s: %v", c.id, err)
-			}
-			return
-		}
-
-		var msg inboundMessage
-		if err := json.Unmarshal(data, &msg); err != nil {
-			log.Printf("bad payload from %s: %v", c.id, err)
-			continue
-		}
-		h.handleInbound(c, msg)
-	}
-}
-
-func (c *client) writePump() {
-	ticker := time.NewTicker(40 * time.Second)
-	defer func() {
-		ticker.Stop()
-		c.conn.Close()
-	}()
-
-	for {
-		select {
-		case msg, ok := <-c.send:
-			if !ok {
-				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
-				return
-			}
-			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
-				log.Printf("write error to %s: %v", c.id, err)
-				return
-			}
-		case <-ticker.C:
-			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-				return
-			}
-		}
-	}
-}
-
-func (c *client) sendJSON(v interface{}) {
-	data, err := json.Marshal(v)
-	if err != nil {
-		log.Printf("marshal sendJSON: %v", err)
-		return
-	}
-	select {
-	case c.send <- data:
-	default:
-		log.Printf("send buffer full for %s", c.id)
-	}
-}
-
 func spaHandler(staticDir string) http.Handler {
 	fs := http.FileServer(http.Dir(staticDir))
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Serve the WebSocket endpoint separately.
 		if r.URL.Path == "/ws" {
 			w.WriteHeader(http.StatusNotFound)
 			return
