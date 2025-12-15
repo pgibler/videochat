@@ -1,5 +1,5 @@
 {
-  "name": "webrtc-go-spa-frontend",
+  "name": "videochat-frontend",
   "version": "0.0.1",
   "private": true,
   "type": "module",
