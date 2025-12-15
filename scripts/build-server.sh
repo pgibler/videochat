@@ -10,4 +10,6 @@ echo "==> Building frontend assets"
 echo "==> Building backend binary -> $BINARY_PATH"
 (cd "$ROOT_DIR/backend" && go build -o "$BINARY_PATH" .)
 
-echo "Build complete"
+echo "Build complete."
+echo "Reminder: restart the service to pick up the new binary and assets:"
+echo "  sudo systemctl restart videochat"
