@@ -68,6 +68,14 @@ body {
   align-items: center;
   gap: 10px;
   min-width: 200px;
+  flex-wrap: wrap;
+}
+
+.brand-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .app-name {
@@ -86,6 +94,58 @@ body {
   background: rgba(255, 255, 255, 0.7);
   border: 1px solid var(--stroke);
   border-radius: 12px;
+}
+
+.room-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  background: rgba(37, 99, 235, 0.08);
+  border: 1px solid rgba(37, 99, 235, 0.18);
+  border-radius: 12px;
+  font-weight: 700;
+  color: #0f172a;
+  cursor: pointer;
+  transition: background 150ms ease, box-shadow 150ms ease;
+  position: relative;
+}
+
+.room-chip:hover {
+  background: rgba(37, 99, 235, 0.14);
+  box-shadow: 0 8px 18px rgba(37, 99, 235, 0.18);
+}
+
+.room-chip .code {
+  letter-spacing: 0.04em;
+}
+
+.room-chip .icon {
+  display: inline-flex;
+  color: #1d4ed8;
+}
+
+.room-chip.copied {
+  background: rgba(34, 197, 94, 0.14);
+  border-color: rgba(34, 197, 94, 0.32);
+  color: #14532d;
+  box-shadow: 0 8px 18px rgba(34, 197, 94, 0.18);
+}
+
+.room-chip.copied .icon {
+  color: #15803d;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 .label {
@@ -162,6 +222,18 @@ button:disabled {
   opacity: 0.6;
   cursor: not-allowed;
   box-shadow: none;
+}
+
+.secondary-btn {
+  background: rgba(255, 255, 255, 0.85);
+  color: #0f172a;
+  border: 1px solid var(--stroke);
+  box-shadow: none;
+}
+
+.secondary-btn:hover {
+  background: #ffffff;
+  box-shadow: 0 8px 18px rgba(15, 23, 42, 0.08);
 }
 
 .peer-chip {
@@ -354,11 +426,46 @@ button:disabled {
   color: #1f2937;
   font-size: 15px;
   line-height: 1.6;
+  margin-bottom: 1em;
 }
 
 .hint {
   font-size: 13px;
   color: var(--muted);
+}
+
+.status.error {
+  color: #b91c1c;
+}
+
+.pill.muted {
+  background: rgba(15, 23, 42, 0.05);
+  color: #111827;
+}
+
+.hero {
+  padding: clamp(20px, 6vw, 36px);
+}
+
+.hero-body {
+  display: grid;
+  gap: 12px;
+}
+
+.kicker {
+  margin: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 12px;
+  color: #2563eb;
+  font-weight: 800;
+}
+
+.headline {
+  margin: 8px 0;
+  font-size: clamp(26px, 4vw, 34px);
+  line-height: 1.3;
+  letter-spacing: -0.02em;
 }
 
 @media (max-width: 720px) {

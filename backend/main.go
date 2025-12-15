@@ -11,10 +11,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 
+	"webrtc-go-spa/pkg/rooms"
 	"webrtc-go-spa/pkg/signaling"
 )
 
@@ -36,18 +38,16 @@ func main() {
 		log.Fatalf("redis ping failed: %v", err)
 	}
 
-	store := signaling.NewRedisPresence(rdb, "webrtc")
-	if err := store.Reset(ctx); err != nil {
-		log.Printf("redis reset presence: %v", err)
-	}
-
-	hub := signaling.NewHub(store, signaling.HubOptions{
+	roomStore := rooms.NewRedisStore(rdb, "webrtc")
+	hubs := newHubManager(rdb, signaling.HubOptions{
 		ICEServers: cfg.ICEServers,
 		ICEMode:    cfg.ICEMode,
 	})
 
-	http.Handle("/ws", hub.HTTPHandler())
+	http.Handle("/ws", wsHandler(hubs, roomStore))
 	http.Handle("/api/settings", settingsHandler(cfg))
+	http.Handle("/api/rooms", createRoomHandler(roomStore))
+	http.Handle("/api/rooms/", roomLookupHandler(roomStore))
 	http.Handle("/debug/ice", debugICE(cfg))
 	http.Handle("/", spaHandler(cfg.StaticPath))
 
@@ -269,4 +269,144 @@ func resolveWSURL(cfg config, r *http.Request) string {
 	}
 
 	return fmt.Sprintf("%s://%s/ws", proto, host)
+}
+
+// hubManager keeps one signaling Hub per room, each with isolated Redis keys.
+type hubManager struct {
+	mu   sync.Mutex
+	hubs map[string]*signaling.Hub
+	rdb  *redis.Client
+	opts signaling.HubOptions
+}
+
+func newHubManager(rdb *redis.Client, opts signaling.HubOptions) *hubManager {
+	return &hubManager{
+		hubs: make(map[string]*signaling.Hub),
+		rdb:  rdb,
+		opts: opts,
+	}
+}
+
+func (m *hubManager) hubForRoom(code string) *signaling.Hub {
+	code = strings.TrimSpace(code)
+	if code == "" {
+		return nil
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if h := m.hubs[code]; h != nil {
+		return h
+	}
+
+	store := signaling.NewRedisPresence(m.rdb, fmt.Sprintf("webrtc:room:%s", code))
+	if err := store.Reset(context.Background()); err != nil {
+		log.Printf("presence reset for room %s: %v", code, err)
+	}
+	hub := signaling.NewHub(store, m.opts)
+	m.hubs[code] = hub
+	return hub
+}
+
+func wsHandler(hubs *hubManager, roomStore rooms.Store) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		roomCode := strings.TrimSpace(r.URL.Query().Get("room"))
+		if roomCode == "" {
+			http.Error(w, "missing room code", http.StatusBadRequest)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+
+		if _, err := roomStore.Get(ctx, roomCode); err != nil {
+			if errors.Is(err, rooms.ErrNotFound) {
+				http.Error(w, "room not found", http.StatusNotFound)
+				return
+			}
+			log.Printf("room lookup error: %v", err)
+			http.Error(w, "room lookup failed", http.StatusInternalServerError)
+			return
+		}
+
+		hub := hubs.hubForRoom(roomCode)
+		if hub == nil {
+			http.Error(w, "room not available", http.StatusInternalServerError)
+			return
+		}
+
+		hub.HTTPHandler().ServeHTTP(w, r)
+	})
+}
+
+func createRoomHandler(store rooms.Store) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+
+		room, err := store.Create(ctx)
+		if err != nil {
+			log.Printf("room create error: %v", err)
+			http.Error(w, "failed to create room", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		payload := map[string]interface{}{
+			"code": room.Code,
+			"url":  roomURL(r, room.Code),
+		}
+		_ = json.NewEncoder(w).Encode(payload)
+	})
+}
+
+func roomLookupHandler(store rooms.Store) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		code := strings.TrimPrefix(r.URL.Path, "/api/rooms/")
+		code = strings.Trim(code, "/")
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+
+		room, err := store.Get(ctx, code)
+		if err != nil {
+			if errors.Is(err, rooms.ErrNotFound) {
+				http.NotFound(w, r)
+				return
+			}
+			log.Printf("room lookup error: %v", err)
+			http.Error(w, "failed to lookup room", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		payload := map[string]interface{}{
+			"code":      room.Code,
+			"createdAt": room.CreatedAt,
+			"url":       roomURL(r, room.Code),
+		}
+		_ = json.NewEncoder(w).Encode(payload)
+	})
+}
+
+func roomURL(r *http.Request, code string) string {
+	proto := "http"
+	if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+		proto = "https"
+	}
+	host := r.Host
+	if host == "" {
+		host = "localhost:8080"
+	}
+	return fmt.Sprintf("%s://%s/rooms/%s", proto, host, code)
 }

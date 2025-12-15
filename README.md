@@ -32,6 +32,11 @@ go run main.go
 
 Then open http://localhost:8080 in multiple tabs to see peers join and start/stop broadcasting.
 
+## Rooms
+- Rooms are private and created on demand. Use the landing page “Create private room” button or `POST /api/rooms` to get a `{code, url}`.
+- Share the room URL (e.g., `/rooms/{code}`) so peers can join and enter a display name.
+- WebSocket connections must include the room code (`/ws?room={code}`); presence and broadcasts are isolated per room using Redis.
+
 ## Configuration
 Environment variables (optional):
 - `ADDR` - HTTP listen address (default `:8080`)
