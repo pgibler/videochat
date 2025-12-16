@@ -78,9 +78,21 @@ const RoomUI = (props: { username: string; roomCode: string; roomURL: string; ws
   const [showPeers, setShowPeers] = createSignal(false);
   const [usernames, setUsernames] = createSignal<Record<string, string>>({});
   const [copied, setCopied] = createSignal(false);
+  const [shouldAutoStart, setShouldAutoStart] = createSignal(true);
 
   createEffect(() => {
     if (peers().length === 0) setShowPeers(false);
+  });
+
+  createEffect(() => {
+    if (shouldAutoStart() && connected() && !broadcastEnabled()) {
+      void startBroadcast()
+        .then(() => setShouldAutoStart(false))
+        .catch((err) => {
+          console.error("[ui] auto-start broadcast failed", err);
+          setShouldAutoStart(false);
+        });
+    }
   });
 
   createEffect(() => {
@@ -180,7 +192,14 @@ const RoomUI = (props: { username: string; roomCode: string; roomURL: string; ws
           </button>
           <button
             class={`live-btn ${broadcastEnabled() ? "on" : ""}`}
-            onClick={() => (broadcastEnabled() ? stopBroadcast() : void startBroadcast())}
+            onClick={() => {
+              setShouldAutoStart(false);
+              if (broadcastEnabled()) {
+                stopBroadcast();
+              } else {
+                void startBroadcast().catch((err) => console.error("[ui] manual start failed", err));
+              }
+            }}
           >
             {broadcastEnabled() ? "Stop" : "Go Live"}
           </button>
